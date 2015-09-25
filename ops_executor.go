@@ -45,7 +45,16 @@ func NewOpsExecutor(session *mgo.Session, statsChan chan OpStat, logger *Logger)
 
 func (e *OpsExecutor) execQuery(
 	content Document, coll *mgo.Collection) error {
-	query := coll.Find(content["query"])
+	if content["query"] != nil and content["query"]["$query"] != nil {
+		query := coll.Find(content["query"]["$query"])
+		// TODO instead of ignoring the hint, make sure it has the right ordering
+		if content["query"]["$hint"] != nil {
+			query.hint()
+		}
+		// TODO should make sure multi-key "$orderby" has the right ordering, too
+	} else {
+		query := coll.Find(content["query"])
+	}
 	result := []Document{}
 	if content["ntoreturn"] != nil {
 		if ntoreturn, err := safeGetInt(content["ntoreturn"]); err != nil {
