@@ -7,6 +7,7 @@ import pymongo
 import string
 import threading
 import constants
+from collections import OrderedDict
 
 
 def _make_logger():
@@ -52,13 +53,17 @@ def now_in_utc_secs():
 def create_tailing_cursor(collection, criteria, oplog=False):
     """Create a cursor that constantly tail the latest documents from the
        database"""
-    tailer = collection.find(
-        criteria, slave_okay=True, tailable=True, await_data=True)
-    
+
+    # We used OrderedDict instead of the default dict during serialization
+    # of the MongoDB docs, because we need to preserve the order of the keys
+    # in query.$query.$hint and query.$query.$orderby.
+    tailer = collection.find(criteria, slave_okay=True, tailable=True,
+                             await_data=True, as_class=OrderedDict)
+
     # Set oplog_replay on the cursor, which allows queries against the oplog to run much faster
     if oplog:
         tailer.add_option(pymongo.cursor._QUERY_OPTIONS['oplog_replay'])
-    
+
     return tailer
 
 
