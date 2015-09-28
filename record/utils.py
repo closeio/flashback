@@ -55,7 +55,7 @@ def create_tailing_cursor(collection, criteria, oplog=False):
        database"""
 
     # We used OrderedDict instead of the default dict during serialization
-    # of the MongoDB docs, because we need to preserve the order of the keys
+    # of the MongoDB docs because we need to preserve the order of the keys
     # in query.$query.$hint and query.$query.$orderby.
     tailer = collection.find(criteria, slave_okay=True, tailable=True,
                              await_data=True, as_class=OrderedDict)
