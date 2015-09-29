@@ -12,12 +12,11 @@ import (
 	"github.com/mongodb/mongo-tools/common/json"
 )
 
-// OpsReader Reads the ops from a source and present a interface for consumers
+// OpsReader reads the ops from a source and present an interface for consumers
 // to fetch these ops sequentially.
 type OpsReader interface {
 	// Move to next op and return it. Nil will be returned if the last ops had
-	// already been read, or there is any error occurred.
-	// TODO change from Document to Op
+	// already been read, or if an error occurred.
 	Next() *Op
 
 	// Allow skipping the first N ops in the source file
@@ -146,7 +145,7 @@ func (r *ByLineOpsReader) Next() *Op {
 			return nil
 		}
 		r.opsRead++
-		op := makeOp(rawObj, r.opFilters)
+		op := makeOp(rawObj, jsonText, r.opFilters)
 		if op == nil {
 			continue
 		}
@@ -225,7 +224,9 @@ func PruneEmptyUpdateObj(doc Document, opType string) {
 	}
 }
 
-func makeOp(rawDoc Document, opFilters []string) *Op {
+// Create an Op object given an unmarshalled mongo doc, the original JSON
+// text from the input file, and a list of op filters
+func makeOp(rawDoc Document, rawText string, opFilters []string) *Op {
 	opType := rawDoc["op"].(string)
 	ts := rawDoc["ts"].(time.Time)
 	ns := rawDoc["ns"].(string)
@@ -246,6 +247,7 @@ func makeOp(rawDoc Document, opFilters []string) *Op {
 	}
 
 	var content Document
+
 	// we only handpick the fields that will be of useful for a given op type.
 	switch opType {
 	case "insert":
@@ -271,7 +273,7 @@ func makeOp(rawDoc Document, opFilters []string) *Op {
 	default:
 		return nil
 	}
-	return &Op{dbName, collName, OpType(opType), ts, content}
+	return &Op{dbName, collName, OpType(opType), ts, content, rawText}
 }
 
 type CyclicOpsReader struct {

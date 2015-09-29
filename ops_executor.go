@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"gopkg.in/mgo.v2"
+	"strings"
 	"time"
 )
 
@@ -11,7 +12,7 @@ var (
 	NotSupported = errors.New("op type not supported")
 )
 
-type execute func(content Document, collection *mgo.Collection) error
+type execute func(content Document, textContent string, collection *mgo.Collection) error
 
 type OpsExecutor struct {
 	session   *mgo.Session
@@ -43,10 +44,68 @@ func NewOpsExecutor(session *mgo.Session, statsChan chan OpStat, logger *Logger)
 	return e
 }
 
-func (e *OpsExecutor) execQuery(
-	content Document, coll *mgo.Collection) error {
-	query := coll.Find(content["query"])
+// Given a JSON of the op (as a raw string) and a key (e.g. $hint or $orderby),
+// extract the arguments, transforming { organization: 1, date_created: -1 }
+// into a list ["organization", "-date_created"].
+func getArgs(textContent string, key string) []string {
+
+	// Initialize a list of arguments
+	args := make([]string, 0)
+
+	// Find the key we're looking for in the string
+	start := strings.Index(textContent, "\""+key+"\"")
+	textContent = textContent[start+len(key)+2:]
+
+	// Parse the string assuming proper format (it's safe to do so here
+	// because the string we use has already been parsed to JSON).
+	// States of the parser:
+	// 0 - looking for key
+	// 1 - in the key (looking for its end)
+	// 2 - looking for direction of the index (after found, resets state to 0)
+	state := 0
+	buffer := ""
+	for _, c := range textContent {
+		if state == 0 && c == '}' {
+			break
+		} else if state == 0 && c == '"' {
+			state = 1
+		} else if state == 1 {
+			if c == '"' {
+				args = append(args, buffer)
+				buffer = ""
+				state = 2
+			} else {
+				buffer += string(c)
+			}
+		} else if state == 2 && c == '-' {
+			args[len(args)-1] = "-" + args[len(args)-1]
+		} else if state == 2 && c == '1' {
+			state = 0
+		}
+	}
+	return args
+}
+
+func (e *OpsExecutor) execQuery(content Document, textContent string, coll *mgo.Collection) error {
+	var query *mgo.Query
 	result := []Document{}
+
+	// cast the query to a map of string keys to interfaces
+	q, ok := content["query"].(map[string]interface{})
+
+	// If the query contains $hint or $orderby, we need to make sure that these
+	// are applied via Query.Hint and Query.Sort with the correct order
+	if ok && q["$query"] != nil {
+		query = coll.Find(q["$query"])
+		if q["$hint"] != nil {
+			query.Hint(getArgs(textContent, "$hint")...)
+		}
+		if q["$orderby"] != nil {
+			query.Sort(getArgs(textContent, "$orderby")...)
+		}
+	} else {
+		query = coll.Find(content["query"])
+	}
 	if content["ntoreturn"] != nil {
 		if ntoreturn, err := safeGetInt(content["ntoreturn"]); err != nil {
 			e.logger.Error("could not set ntoreturn: ", err)
@@ -66,24 +125,24 @@ func (e *OpsExecutor) execQuery(
 	return err
 }
 
-func (e *OpsExecutor) execInsert(content Document, coll *mgo.Collection) error {
+func (e *OpsExecutor) execInsert(content Document, textContent string, coll *mgo.Collection) error {
 	return coll.Insert(content["o"])
 }
 
-func (e *OpsExecutor) execUpdate(content Document, coll *mgo.Collection) error {
+func (e *OpsExecutor) execUpdate(content Document, textContent string, coll *mgo.Collection) error {
 	return coll.Update(content["query"], content["updateobj"])
 }
 
-func (e *OpsExecutor) execRemove(content Document, coll *mgo.Collection) error {
+func (e *OpsExecutor) execRemove(content Document, textContent string, coll *mgo.Collection) error {
 	return coll.Remove(content["query"])
 }
 
-func (e *OpsExecutor) execCount(content Document, coll *mgo.Collection) error {
+func (e *OpsExecutor) execCount(content Document, textContent string, coll *mgo.Collection) error {
 	_, err := coll.Count()
 	return err
 }
 
-func (e *OpsExecutor) execFindAndModify(content Document, coll *mgo.Collection) error {
+func (e *OpsExecutor) execFindAndModify(content Document, textContent string, coll *mgo.Collection) error {
 	result := Document{}
 	change := mgo.Change{Update: content["update"].(map[string]interface{})}
 	_, err := coll.Find(content["query"]).Apply(change, result)
@@ -147,8 +206,9 @@ func (e *OpsExecutor) Execute(op *Op) error {
 
 	block := func() error {
 		content := op.Content
+		textContent := op.TextContent
 		coll := e.session.DB(op.Database).C(op.Collection)
-		return e.subExecutes[op.Type](content, coll)
+		return e.subExecutes[op.Type](content, textContent, coll)
 	}
 	err := retryOnSocketFailure(block, e.session, e.logger)
 
