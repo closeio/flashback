@@ -198,7 +198,8 @@ func makeOpsChan(style string, opsFilename string, logger *flashback.Logger) (ch
 		}
 	}
 
-	// Set up the chosen start time and skip some ops if requested
+	// Set up the chosen start time and skip some ops if requested (related
+	// to --start_time and --numSkipOps params)
 	if startTime > 0 {
 		if _, err := reader.SetStartTime(startTime); err != nil {
 			return nil, err
@@ -210,7 +211,7 @@ func makeOpsChan(style string, opsFilename string, logger *flashback.Logger) (ch
 		}
 	}
 
-	// Return the correct dispatched
+	// Return the correct dispatcher
 	if style == "stress" {
 		return flashback.NewBestEffortOpsDispatcher(reader, maxOps, logger), nil
 	} else {
@@ -337,7 +338,7 @@ func main() {
 				}
 			}
 
-			// Execute the operations
+			// Execute the operation for each node
 			for _, ws := range workerStates {
 				go execute(ws.exec, ws.name)
 			}
