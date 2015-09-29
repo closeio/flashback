@@ -8,6 +8,7 @@ from bson.json_util import dumps
 
 
 def dump_op(output, op):
+    """Copy relevant fields of an op and dump them into the output file"""
     copier = utils.DictionaryCopier(op)
     copier.copy_fields("ts", "ns", "op")
     op_type = op["op"]
@@ -35,46 +36,51 @@ def merge_to_final_output(oplog_output_file, profiler_output_files, output_file)
     * Why not merge earlier:
         It's definitely inefficient to merge the entries when we just retrieve
         these documents from mongodb. However we designed this script to be able
-        to pull the docs from differnt servers, as a result it's hard to do the
+        to pull the docs from different servers, as a result it's hard to do the
         on-time merge since you cannot determine if some "old" entries will come
-        later."""
+        later.
+    """
     oplog = open(oplog_output_file, "rb")
-    
-    # create a map of profiler file names to files
+
+    # Create a map of profiler file names to files
     profiler_files = {}
     for profiler_file in profiler_output_files:
         profiler_files[profiler_file] = open(profiler_file, "rb")
-        
+
     output = open(output_file, "wb")
     logger = utils.LOG
 
     logger.info("Starts completing the insert options")
     oplog_doc = utils.unpickle(oplog)
-    # create a map of (profiler file names, doc ts) to doc
+
+    # Create a map of tuple(doc's timestamp, profiler file names) to doc. This
+    # makes it easy to fetch the earliest doc in the group on each iteration.
     profiler_docs = {}
     for file_name in profiler_files:
         doc = utils.unpickle(profiler_files[file_name])
-        # associate doc with a tuple representing the ts and source filename
-        # this makes it easy to fetch the earliest doc in the group on each
-        # iteration
         if doc:
             profiler_docs[(doc["ts"], file_name)] = doc
+
     inserts = 0
     noninserts = 0
     severe_inconsistencies = 0
     mild_inconsistencies = 0
 
-    # read docs until either we exhaust the oplog or all ops in the profile logs
+    # Read docs until either we exhaust the oplog or all ops in the profile logs
     while oplog_doc and len(profiler_docs) > 0:
         if (noninserts + inserts) % 2500 == 0:
             logger.info("processed %d items", noninserts + inserts)
-            
-        # get the earliest profile doc out of all profiler_docs
-        key = min(profiler_docs.keys())
+
+        # Get the earliest profile doc out of all profiler_docs. In this case
+        # min traverses through the keys of the dict and picks the one with
+        # smallest ts.
+        key = min(profiler_docs)
         profiler_doc = profiler_docs[key]
-        # remove the doc and fetch a new one
-        del(profiler_docs[key])
-        # the first field in the key is the file name
+
+        # Remove the doc and fetch a new one
+        del profiler_docs[key]
+
+        # Retrieve the doc (key[1] is the file name)
         doc = utils.unpickle(profiler_files[key[1]])
         if doc:
             profiler_docs[(doc["ts"], key[1])] = doc
@@ -121,7 +127,7 @@ def merge_to_final_output(oplog_output_file, profiler_output_files, output_file)
         doc = utils.unpickle(profiler_files[key[1]])
         if doc:
             profiler_docs[(doc["ts"], key[1])] = doc
-            
+
         if profiler_doc["op"] == "insert":
             break
         dump_op(output, profiler_doc)

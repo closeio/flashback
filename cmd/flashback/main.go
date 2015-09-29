@@ -188,13 +188,14 @@ func parseFlags() error {
 	return nil
 }
 
+// Prepare an ops channel which will feed new ops to each worker
 func makeOpsChan(style string, opsFilename string, logger *flashback.Logger) (chan *flashback.Op, error) {
-	// Prepare to dispatch ops
 	var (
 		reader flashback.OpsReader
 		err    error
 	)
 
+	// Set up the correct reader
 	if style == "real" && cyclic == true {
 		reader = flashback.NewCyclicOpsReader(func() flashback.OpsReader {
 			err, reader := flashback.NewFileByLineOpsReader(opsFilename, logger, opFilter)
@@ -208,6 +209,8 @@ func makeOpsChan(style string, opsFilename string, logger *flashback.Logger) (ch
 		}
 	}
 
+	// Set up the chosen start time and skip some ops if requested (related
+	// to --start_time and --numSkipOps params)
 	if startTime > 0 {
 		if _, err := reader.SetStartTime(startTime); err != nil {
 			return nil, err
@@ -219,6 +222,7 @@ func makeOpsChan(style string, opsFilename string, logger *flashback.Logger) (ch
 		}
 	}
 
+	// Return the correct dispatcher
 	if style == "stress" {
 		return flashback.NewBestEffortOpsDispatcher(reader, maxOps, logger), nil
 	} else {
@@ -226,6 +230,9 @@ func makeOpsChan(style string, opsFilename string, logger *flashback.Logger) (ch
 	}
 }
 
+// Each node represents a separate MongoDB instance that you want to test.
+// Typically you only have one node, but you can also add extra "challenger"
+// nodes.
 type node struct {
 	name          string
 	url           string
@@ -234,6 +241,8 @@ type node struct {
 	statsAnalyzer *flashback.StatsAnalyzer
 }
 
+// Each worker has a separate nodeWorkerState for each node. This struct
+// contains information about the MongoDB connection for a given worker/node.
 type nodeWorkerState struct {
 	name    string
 	session *mgo.Session
@@ -252,6 +261,7 @@ func main() {
 
 	createNode := func(name string, nodeUrl string, filename string) node {
 		var n node
+
 		// stats file
 		if filename != "" {
 			var err error
@@ -260,6 +270,7 @@ func main() {
 		} else {
 			n.statsFile = nil
 		}
+
 		n.name = name
 		n.url = nodeUrl
 		n.statsChan = make(chan flashback.OpStat, workers*100)
@@ -268,22 +279,22 @@ func main() {
 	}
 
 	var nodes []node
-	// create "default" node
+
+	// create the "default" node
 	nodes = append(nodes, createNode("default", url, statsFilename))
-	// create "challenger" node if necessary
+
+	// create the "challenger" nodes if they were specified
 	if challengerUrl != "" {
 		nodes = append(nodes, createNode("challenger", challengerUrl, challengerStatsFilename))
 	}
-	// create "challenger2" node if necessary
 	if challengerUrl2 != "" {
 		nodes = append(nodes, createNode("challenger2", challengerUrl2, challengerStatsFilename2))
 	}
-	// create "challenger3" node if necessary
 	if challengerUrl3 != "" {
 		nodes = append(nodes, createNode("challenger3", challengerUrl3, challengerStatsFilename3))
 	}
 
-	// close stats files
+	// Close stats files
 	for _, n := range nodes {
 		if n.statsFile != nil {
 			defer n.statsFile.Close()
@@ -298,6 +309,7 @@ func main() {
 
 		workerStates := make([]nodeWorkerState, len(nodes))
 
+		// Connect to MongoDB for each node
 		for i, n := range nodes {
 			session, err := mgo.Dial(n.url)
 			panicOnError(err)
@@ -311,6 +323,8 @@ func main() {
 		}
 
 		for {
+
+			// Get the next operation to execute from the operations' channel
 			op := <-opsChan
 			if op == nil {
 				break
@@ -335,11 +349,14 @@ func main() {
 				}
 			}
 
+			// Execute the operation for each node
 			for _, ws := range workerStates {
 				go execute(ws.exec, ws.name)
 			}
 			wg.Wait()
 
+			// If slow operations' threshold has been set, determine if any of
+			// the ops were slow and print some information about them
 			if slowOpThresholdMs > 0 {
 				isSlow := func(latency time.Duration) bool {
 					return latency > time.Duration(slowOpThresholdMs)*time.Millisecond
@@ -361,16 +378,19 @@ func main() {
 				}
 			}
 
+			// Increase the counter of executed operations
 			atomic.AddInt64(&opsExecuted, 1)
 		}
 		exit <- 1
 		logger.Infof("Worker #%d done!\n", id)
 	}
 
+	// Make the workers execute the operations concurrently
 	for i := 0; i < workers; i++ {
 		go fetch(i)
 	}
 
+	// Report on the status of each worker
 	report := func() {
 		printStatus := func(status *flashback.ExecutionStatus, statsOut *os.File, name string) {
 			logger.Infof("[%s] Executed %d ops (%d in interval), got %d errors (%d in interval), "+
@@ -416,8 +436,8 @@ func main() {
 		}
 	}
 
-	reportTicker := time.NewTicker(5 * time.Second)
 	// Periodically report execution status
+	reportTicker := time.NewTicker(5 * time.Second)
 	go func() {
 		for range reportTicker.C {
 			report()
@@ -431,6 +451,7 @@ func main() {
 		received += 1
 	}
 	reportTicker.Stop()
-	// report one last time
+
+	// Report one last time
 	report()
 }
