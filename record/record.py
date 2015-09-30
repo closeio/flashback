@@ -21,37 +21,44 @@ def tail_to_queue(tailer, identifier, doc_queue, state, end_time,
     """
     Accept a tailing cursor and serialize the retrieved documents to a fifo
     queue.
+
     @param identifier: when passing the retrieved document to the queue, we
         will attach a unique identifier that allows the queue consumers to
-        process different sources of documents accordingly.
+        process different sources of documents accordingly. There's a separate
+        identifier for the oplog and for each database-host pair for which
+        we tail the profile collection.
     @param check_duration_secs: if we cannot retrieve the latest document,
-        it will sleep for a period of time and then try again.
+        this queuing loop will sleep for that many seconds and then try again.
     """
     tailer_state = state.tailer_states[identifier]
-    preformed_loops = 0
+    first_loop = True
     while tailer.alive and all(s.alive for s in state.tailer_states.values()):
         try:
+            # Get the next doc from the tailing cursor
             doc = tailer.next()
-            tailer_state.last_received_ts = doc["ts"]
-            if state.timeout and tailer_state.last_received_ts >= end_time:
-                break
-
-            if type(tailer_state.last_received_ts) is Timestamp:
-                tailer_state.last_received_ts.as_datetime()
-
-            doc_queue.put_nowait((identifier, doc))
-            tailer_state.entries_received += 1
         except StopIteration:
             if state.timeout:
                 break
-            tailer_state.last_get_none_ts = datetime.now()
+            tailer_state.last_get_none_ts = datetime.utcnow()
             time.sleep(check_duration_secs)
         except pymongo.errors.OperationFailure, e:
-            if preformed_loops == 0:
+            if first_loop:
                 utils.LOG.error(
                     "BADRUN: source %s: We appear to not have the %s collection created or is non-capped! %s",
                     identifier, tailer.collection, e)
-        preformed_loops += 1
+        else:
+            # Set last_received_ts based on the latest doc
+            tailer_state.last_received_ts = doc["ts"]
+
+            # If it's time to stop recording or if the timestamp of the last
+            # received doc is >= end_time, break out of the loop
+            if state.timeout and tailer_state.last_received_ts >= end_time:
+                break
+
+            doc_queue.put_nowait((identifier, doc))
+            tailer_state.entries_received += 1
+
+        first_loop = False
 
     tailer_state.alive = False
     utils.LOG.info("source %s: Tailing to queue completed!", identifier)
@@ -68,11 +75,11 @@ class MongoQueryRecorder(object):
         def make_tailer_state():
             """Return the tailer state "struct" """
             s = utils.EmptyClass()
-            s.entries_received = 0
-            s.entries_written = 0
-            s.alive = True
-            s.last_received_ts = None
-            s.last_get_none_ts = None
+            s.entries_received = 0  # how many entries were put in the global doc queue
+            s.entries_written = 0  # how many entries were written to the output file
+            s.alive = True  # is this thread still alive (i.e. working)?
+            s.last_received_ts = None  # timestamp of the latest received doc
+            s.last_get_none_ts = None  # last time this thread didn't get anything from the tailing cursor
             return s
 
         def __init__(self, tailer_names):
@@ -109,6 +116,7 @@ class MongoQueryRecorder(object):
             utils.log.error("Detected either no profile or oplog servers, bailing")
             sys.exit(1)
 
+        # Connect to each MongoDB server that we want to get the oplog data from
         self.oplog_clients = {}
         for index, server in enumerate(oplog_servers):
             mongodb_uri = server['mongodb_uri']
@@ -116,9 +124,9 @@ class MongoQueryRecorder(object):
             server_string = "%s:%s" % (nodelist[0][0], nodelist[0][1])
 
             self.oplog_clients[server_string] = self.connect_mongo(server)
-            utils.LOG.info("oplog server %d: %s", index, self.sanatize_server(server))
+            utils.LOG.info("oplog server %d: %s", index, self.sanitize_server(server))
 
-        # Create a mongo client for each profiler server
+        # Connect to each MongoDB server that we want to get the profile data from
         self.profiler_clients = {}
         for index, server in enumerate(profiler_servers):
             mongodb_uri = server['mongodb_uri']
@@ -126,30 +134,40 @@ class MongoQueryRecorder(object):
             server_string = "%s:%s" % (nodelist[0][0], nodelist[0][1])
 
             self.profiler_clients[server_string] = self.connect_mongo(server)
-            utils.LOG.info("profiling server %d: %s", index, self.sanatize_server(server))
+            utils.LOG.info("profiling server %d: %s", index, self.sanitize_server(server))
 
-    def sanatize_server(self, server_config):
+        utils.LOG.info('Successfully connected to %d oplog server(s) and %d profiler server(s)', len(self.oplog_clients), len(self.profiler_clients))
+
+    def sanitize_server(self, server_config):
         if 'user' in server_config:
             server_config['user'] = "Redacted"
         if 'password' in server_config:
             server_config['password'] = "Redacted"
-        print(server_config)
         return server_config
 
     @staticmethod
     def _process_doc_queue(doc_queue, files, state):
         """Writes the incoming docs to the corresponding files"""
-        # Keep waiting if any of the tailer thread is still at work.
-        while any(s.alive for s in state.tailer_states.values()):
+
+        # Keep receiving docs via the global doc queue and dumping them to
+        # files if any of the tailer threads are still at work or if the
+        # doc queue is not empty.
+        queue_is_empty = False
+        while any(s.alive for s in state.tailer_states.values()) or not queue_is_empty:
             try:
                 name, doc = doc_queue.get(block=True, timeout=1)
+            except Queue.Empty:
+                # Continue if we still can't get anything from the queue after the timeout
+                queue_is_empty = True
+                continue
+            else:
+                queue_is_empty = False
                 state.tailer_states[name].entries_written += 1
                 cPickle.dump(doc, files[name])
-            except Queue.Empty:
-                # gets nothing after timeout
-                continue
+
         for f in files.values():
             f.flush()
+
         utils.LOG.info("All received docs are processed!")
 
     @staticmethod
@@ -158,12 +176,20 @@ class MongoQueryRecorder(object):
         msgs = []
         for key in state.tailer_states.keys():
             tailer_state = state.tailer_states[key]
+
+            # oplog tailer returns "ts" as a Timestamp - we want to be able
+            # to easily compare last_received_ts and last_get_none_ts, so
+            # we convert the Timestamp to a datetime
+            last_received_ts = tailer_state.last_received_ts
+            if isinstance(last_received_ts, Timestamp):
+                last_received_ts = last_received_ts.as_datetime()
+
             msg = "\n\t{}: received {} entries, {} of them were written, "\
                   "last received entry ts: {}, last get-none ts: {}" .format(
                       key,
                       tailer_state.entries_received,
                       tailer_state.entries_written,
-                      str(tailer_state.last_received_ts),
+                      str(last_received_ts),
                       str(tailer_state.last_get_none_ts))
             msgs.append(msg)
 
@@ -251,9 +277,12 @@ class MongoQueryRecorder(object):
         """Generate the threads that tail the data sources and put the fetched
         entries to the files"""
 
-        # Create working threads to handle to track/dump mongodb activities
-        workers_info = []
+        # Initialize a thread-safe queue that we'll put the docs into
         doc_queue = Queue.Queue()
+
+        # Initialize a list that will keep track of all the worker threads that
+        # handle tracking/dumping of mongodb activities
+        workers_info = []
 
         # Writer thread, we only have one writer since we assume all files will
         # be written to the same device (disk or SSD), as a result it yields
@@ -265,49 +294,60 @@ class MongoQueryRecorder(object):
                 args=(doc_queue, files, state))
         })
 
-        # Create an oplog collection tailer for each db
-        for profiler_name, client in self.oplog_clients.items():
-            tailer = utils.get_oplog_tailer(client, ["i"],
+        # For each server in the "oplog_servers" config...
+        for server_string, mongo_client in self.oplog_clients.items():
+
+            # Create a tailing cursor (aka a tailer) on an oplog collection
+            tailer = utils.get_oplog_tailer(mongo_client, ["i"],
                                             self.config["target_databases"],
                                             self.config["target_collections"],
                                             Timestamp(start_utc_secs, 0))
-            oplog_cursor_id = tailer.cursor_id
+
+            # Create a new thread and add some metadata to it
             workers_info.append({
-                "name": "tailing-oplogs on %s" % profiler_name,
+                "name": "tailing-oplogs on %s" % server_string,
                 "on_close":
-                    lambda: self.oplog_client.kill_cursors([oplog_cursor_id]),
+                    lambda: self.oplog_client.kill_cursors([tailer.cursor_id]),
                 "thread": Thread(
                     target=tail_to_queue,
                     args=(tailer, "oplog", doc_queue, state,
                           Timestamp(end_utc_secs, 0)))
             })
 
-        # Create a profile collection tailer for each db
         start_datetime = datetime.utcfromtimestamp(start_utc_secs)
         end_datetime = datetime.utcfromtimestamp(end_utc_secs)
-        for profiler_name, client in self.profiler_clients.items():
+
+
+        # For each server in the "profiler_servers" config...
+        for server_string, mongo_client in self.profiler_clients.items():
+
+            # For each database in the "target_databases" config...
             for db in self.config["target_databases"]:
-                tailer = utils.get_profiler_tailer(client,
-                                                   db,
+
+                # Create a tailing cursor (aka a tailer) on a profile collection
+                tailer = utils.get_profiler_tailer(mongo_client, db,
                                                    self.config["target_collections"],
                                                    start_datetime)
-                tailer_id = "%s_%s" % (db, profiler_name)
-                profiler_cursor_id = tailer.cursor_id
+
+                # Create a new thread and add some metadata to it
+                tailer_id = "%s_%s" % (db, server_string)
                 workers_info.append({
-                    "name": "tailing-profiler for %s on %s" % (db, profiler_name),
+                    "name": "tailing-profiler for %s on %s" % (db, server_string),
                     "on_close":
-                        lambda: self.profiler_client.kill_cursors([profiler_cursor_id]),
+                        lambda: self.profiler_client.kill_cursors([tailer.cursor_id]),
                     "thread": Thread(
                         target=tail_to_queue,
                         args=(tailer, tailer_id, doc_queue, state,
                               end_datetime))
                 })
 
+        # Deamonize each thread and start it
         for worker_info in workers_info:
             utils.LOG.info("Starting thread: %s", worker_info["name"])
             worker_info["thread"].setDaemon(True)
             worker_info["thread"].start()
 
+        # Return the list of all the started threads
         return workers_info
 
     def _join_workers(self, state, workers_info):
@@ -338,7 +378,7 @@ class MongoQueryRecorder(object):
         return MongoQueryRecorder._report_status(state)
 
     def record(self):
-        """Record the activities in the multithreading way"""
+        """Record the activities in a multithreaded way"""
         start_utc_secs = utils.now_in_utc_secs()
         end_utc_secs = utils.now_in_utc_secs() + self.config["duration_secs"]
 
@@ -374,16 +414,21 @@ class MongoQueryRecorder(object):
                 and not self.force_quit:
             time.sleep(1)
 
+        # Indicate that it's time to stop
         state.timeout = True
 
+        # Wait until all the workers finish
         self._join_workers(state, workers_info)
-        timer_control.set()  # stop status report
+
+        # Stop reporting the status
+        timer_control.set()
         utils.LOG.info("Preliminary recording completed!")
 
+        # Close all the file handlers
         for f in files.values():
             f.close()
 
-        # Fill the missing insert op details from oplog
+        # Fill the missing insert op details from the oplog
         merge.merge_to_final_output(
             oplog_output_file=self.config["oplog_output_file"],
             profiler_output_files=profiler_output_files,
