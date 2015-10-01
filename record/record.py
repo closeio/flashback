@@ -414,6 +414,13 @@ class MongoQueryRecorder(object):
                 and not self.force_quit:
             time.sleep(1)
 
+        # Log the reason for stopping
+        utils.LOG.info("Due time arrived! All tailers alive: %s; End time passed: %s; Force quit requested: %s.",
+            all(s.alive for s in state.tailer_states.values()),
+            (utils.now_in_utc_secs() >= end_utc_secs),
+            self.force_quit
+        )
+
         # Indicate that it's time to stop
         state.timeout = True
 
