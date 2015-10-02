@@ -1,5 +1,6 @@
 """This script allows us to manually merge the results from oplog and profiling
 results."""
+import os
 import utils
 import config
 import calendar
@@ -138,10 +139,17 @@ def merge_to_final_output(oplog_output_file, profiler_output_files, output_file)
                 "  severe ts incosistencies: %d\n"
                 "  mild ts incosistencies: %d\n", inserts, noninserts,
                 severe_inconsistencies, mild_inconsistencies)
+
     for f in [oplog, output]:
         f.close()
     for f in profiler_files.values():
         f.close()
+
+    # Clean up temporary files (oplog + profiler files), since everything is
+    # already in the main output file
+    for f in profiler_output_files:
+        os.remove(f)
+    os.remove(oplog_output_file)
 
     return True
 
