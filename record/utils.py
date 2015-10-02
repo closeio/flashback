@@ -51,8 +51,13 @@ def now_in_utc_secs():
 
 
 def create_tailing_cursor(collection, criteria, oplog=False):
-    """Create a cursor that constantly tail the latest documents from the
-       database"""
+    """
+    Create a cursor that constantly tails the latest documents from the
+    database.
+
+    criteria is a query dict (for filtering op types, targeting a specifc set
+    of collections, etc.).
+    """
 
     # We used OrderedDict instead of the default dict during serialization
     # of the MongoDB docs because we need to preserve the order of the keys
