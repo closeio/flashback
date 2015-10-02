@@ -413,8 +413,8 @@ class MongoQueryRecorder(object):
             ):
                 cnt += 1
 
-            self.new_config['output_file'] += '_%d' % cnt
-            self.new_config['oplog_output_file'] += '_%d' % cnt
+            new_config['output_file'] += '_%d' % cnt
+            new_config['oplog_output_file'] += '_%d' % cnt
 
         return new_config
 
